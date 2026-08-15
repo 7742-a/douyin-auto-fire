@@ -171,14 +171,15 @@ GitHub Actions 不会自动扫码登录，也不会绕过验证码或安全验�
 
 ## 8. 失败日志
 
-工作流失败时会上传 `artifacts/`，其中可能包含：
+工作流失败时只会上传不包含会话凭据的诊断文件：
 
 - `run.log`
 - `result.json`
-- `screenshots/`
-- `traces/`
 
-失败 Artifact 保留 3 天。截图和日志可能包含聊天隐私，请勿公开分享。
+截图和 Playwright trace 可能包含私人聊天内容或 Cookie，只保留在 runner
+的临时磁盘，不会上传为公开仓库的 Actions artifact。
+
+失败 Artifact 保留 3 天。日志可能包含好友名称或错误上下文，请勿公开分享。
 
 ## 注意
 

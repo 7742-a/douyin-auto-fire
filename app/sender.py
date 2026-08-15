@@ -16,6 +16,8 @@ LATEST_OUTGOING_MESSAGE = (
     '.messageMessageBoxmessageBox:has(.messageMessageBoxcontentBox.messageMessageBoxisFromMe)'
 )
 STICKER_CONFIRM_ANCHOR = "data-douyin-sender-anchor"
+TEXT_CONFIRM_TIMEOUT_MS = 30_000
+TEXT_CONFIRM_GRACE_MS = 2_000
 STICKER_FAILURE_MARKERS = (
     "text=发送失败",
     '[aria-label*="重试"]',
@@ -49,22 +51,65 @@ async def send_message(page: Page, chat: DouyinChat, message: Message, stickers:
 async def send_text(chat: DouyinChat, content: str) -> None:
     editor = await chat.message_input()
     page = editor.page
-    messages = page.locator('[data-e2e="msg-item-content"]')
-    before = await messages.count()
+    before = await _mark_latest_outgoing_message(page)
     await editor.click()
     await page.keyboard.insert_text(content)
     await page.keyboard.press("Enter")
+    await _confirm_text_sent(page, before, content)
+
+
+async def _confirm_text_sent(page: Page, before: tuple[str, str], content: str) -> None:
+    anchor, before_content = before
     try:
         await page.wait_for_function(
-            """([selector, count, text]) => {
-                const items = [...document.querySelectorAll(selector)];
-                return items.length > count && items.some(item => item.textContent.includes(text));
+            """([selector, anchor, previousContent, expectedText]) => {
+                const message = document.querySelector(selector);
+                if (!message) return false;
+                const body = message.querySelector('[data-e2e="msg-item-content"]') || message;
+                const isNewMessage =
+                    message.getAttribute('data-douyin-sender-anchor') !== anchor ||
+                    body.innerHTML !== previousContent;
+                if (!isNewMessage) return false;
+                const normalize = value => (value || '').normalize().replace(/\\s+/g, ' ').trim();
+                return normalize(body.textContent).includes(normalize(expectedText));
             }""",
-            arg=['[data-e2e="msg-item-content"]', before, content],
-            timeout=10_000,
+            arg=[LATEST_OUTGOING_MESSAGE, anchor, before_content, content],
+            timeout=TEXT_CONFIRM_TIMEOUT_MS,
         )
     except Exception as exc:
-        raise PageOperationError("文字消息已触发发送，但无法确认是否发送成功；为避免重复不会自动重试") from exc
+        # The Douyin page can receive its own message just after Playwright's wait
+        # expires, especially when the runner's IM WebSocket reconnects. Give the
+        # DOM one final short window and inspect the newest outgoing message directly.
+        await page.wait_for_timeout(TEXT_CONFIRM_GRACE_MS)
+        try:
+            confirmed = await _latest_outgoing_text_matches(page, anchor, before_content, content)
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            raise PageOperationError("文字消息已触发发送，但无法确认是否发送成功；为避免重复不会自动重试") from exc
+    finally:
+        await _clear_confirmation_anchors(page)
+
+
+async def _latest_outgoing_text_matches(
+    page: Page,
+    anchor: str,
+    before_content: str,
+    expected_text: str,
+) -> bool:
+    latest = page.locator(LATEST_OUTGOING_MESSAGE).first
+    if not await latest.count():
+        return False
+    body = latest.locator('[data-e2e="msg-item-content"]').first
+    if not await body.count():
+        body = latest
+    current_anchor = await latest.get_attribute(STICKER_CONFIRM_ANCHOR)
+    current_content = await body.inner_html()
+    if current_anchor == anchor and current_content == before_content:
+        return False
+    actual = " ".join((await body.inner_text()).split())
+    expected = " ".join(expected_text.split())
+    return expected in actual
 
 
 async def send_image(page: Page, image_path: str) -> None:
@@ -198,10 +243,14 @@ async def _confirm_sticker_sent(
     except Exception as exc:
         raise PageOperationError(f"原生表情“{name}”已点击，但没有检测到新的已发送消息") from exc
     finally:
-        anchors = page.locator(f"[{STICKER_CONFIRM_ANCHOR}]")
-        try:
-            await anchors.evaluate_all(
-                "elements => elements.forEach(element => element.removeAttribute('data-douyin-sender-anchor'))"
-            )
-        except Exception:
-            pass
+        await _clear_confirmation_anchors(page)
+
+
+async def _clear_confirmation_anchors(page: Page) -> None:
+    anchors = page.locator(f"[{STICKER_CONFIRM_ANCHOR}]")
+    try:
+        await anchors.evaluate_all(
+            "elements => elements.forEach(element => element.removeAttribute('data-douyin-sender-anchor'))"
+        )
+    except Exception:
+        pass
